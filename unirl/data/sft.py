@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import random
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Tuple
 
 from unirl.data.datasets import _LEGACY_EMBEDDING_FIELDS, _normalize_media_refs, _resolve_media_uri
 
 logger = logging.getLogger(__name__)
+
+
+def _manifest_fingerprint(handle: BinaryIO) -> str:
+    """Hash the same open manifest snapshot used for parsing."""
+    handle.seek(0)
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _file_identity(stat: os.stat_result) -> Tuple[int, int, int, int, int]:
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
 
 _SUPERVISED_EXCLUDED_KEYS = {
     "prompt",
@@ -167,28 +182,36 @@ class SupervisedDataset:
         self._base_dir = os.path.dirname(os.path.abspath(file_path))
         prefix = os.path.basename(file_path) or "sft_source"
         self.records: List[Dict[str, Any]] = []
-        for idx, item in enumerate(self._iter_raw(file_path)):
-            record = normalize_supervised_example(item, default_sample_id=f"{prefix}:{idx}", base_dir=self._base_dir)
-            self.records.append(record)
+        with open(file_path, "rb") as handle:
+            initial_identity = _file_identity(os.fstat(handle.fileno()))
+            for idx, item in enumerate(self._iter_raw(file_path, handle)):
+                record = normalize_supervised_example(
+                    item,
+                    default_sample_id=f"{prefix}:{idx}",
+                    base_dir=self._base_dir,
+                )
+                self.records.append(record)
+            self.fingerprint = _manifest_fingerprint(handle)
+            final_identity = _file_identity(os.fstat(handle.fileno()))
         if not self.records:
             raise ValueError(f"No supervised examples found in {file_path}")
+        if initial_identity != final_identity or final_identity != _file_identity(os.stat(file_path)):
+            raise RuntimeError(f"Supervised manifest changed while it was being parsed: {file_path}")
         logger.info("Loaded %d supervised examples from %s", len(self.records), file_path)
 
     @staticmethod
-    def _iter_raw(path: str) -> Iterator[Dict[str, Any]]:
+    def _iter_raw(path: str, handle: BinaryIO) -> Iterator[Dict[str, Any]]:
         if path.endswith(".jsonl"):
-            with open(path) as fh:
-                for line_num, line in enumerate(fh, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(f"{path}:{line_num}: invalid JSON — {exc}") from exc
+            for line_num, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{path}:{line_num}: invalid JSON — {exc}") from exc
         elif path.endswith(".json"):
-            with open(path) as fh:
-                data = json.load(fh)
+            data = json.load(handle)
             if not isinstance(data, list):
                 raise ValueError(f"{path}: .json supervised manifests must be a list of objects.")
             yield from data
@@ -215,16 +238,12 @@ class SupervisedDataSource:
     ) -> None:
         self.dataset = SupervisedDataset(manifest_path)
         self.eval_dataset = SupervisedDataset(eval_manifest_path) if eval_manifest_path else None
-        if self.eval_dataset is None:
-            logger.warning(
-                "SupervisedDataSource: no eval_manifest_path — eval batches fall back to the "
-                "TRAIN set (eval loss then measures training data)."
-            )
         self.seed = seed
         self.shuffle = shuffle
         self._epoch = 0
         self._pos = 0
         self._order = self._make_order()
+        self._peeked: Optional[Tuple[List[Dict[str, Any]], int, int]] = None
 
     def _make_order(self) -> List[int]:
         order = list(range(len(self.dataset)))
@@ -233,6 +252,8 @@ class SupervisedDataSource:
         return order
 
     def get_samples(self, batch_size: int) -> List[Dict[str, Any]]:
+        if self._peeked is not None:
+            raise RuntimeError("SupervisedDataSource.get_samples: commit the pending peeked batch before advancing.")
         batch: List[Dict[str, Any]] = []
         while len(batch) < batch_size:
             if self._pos >= len(self._order):
@@ -243,34 +264,97 @@ class SupervisedDataSource:
             self._pos += 1
         return batch
 
+    def peek_samples(self, batch_size: int) -> List[Dict[str, Any]]:
+        """Prepare the next batch without advancing the checkpointed cursor."""
+        if self._peeked is not None:
+            raise RuntimeError("SupervisedDataSource.peek_samples: a batch is already pending.")
+        before_epoch, before_pos = self._epoch, self._pos
+        batch = self.get_samples(batch_size)
+        after_epoch, after_pos = self._epoch, self._pos
+        self._epoch, self._pos = before_epoch, before_pos
+        self._order = self._make_order()
+        self._peeked = (batch, after_epoch, after_pos)
+        return batch
+
+    def commit_peeked_samples(self) -> List[Dict[str, Any]]:
+        """Advance to and return the batch previously produced by ``peek_samples``."""
+        if self._peeked is None:
+            raise RuntimeError("SupervisedDataSource.commit_peeked_samples: no batch is pending.")
+        batch, epoch, position = self._peeked
+        self._peeked = None
+        self._epoch, self._pos = epoch, position
+        self._order = self._make_order()
+        return batch
+
     @property
     def epoch(self) -> float:
         """Fractional epochs consumed — for logging."""
         return self._epoch + self._pos / max(1, len(self.dataset))
 
-    def state_dict(self) -> Dict[str, int]:
-        return {"epoch": self._epoch, "position": self._pos, "seed": self.seed}
+    @property
+    def has_eval_data(self) -> bool:
+        return self.eval_dataset is not None
 
-    def load_state_dict(self, state: Dict[str, int]) -> None:
-        if state.get("seed", self.seed) != self.seed:
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "epoch": self._epoch,
+            "position": self._pos,
+            "seed": self.seed,
+            "shuffle": self.shuffle,
+            "manifest_fingerprint": self.dataset.fingerprint,
+            "num_records": len(self.dataset),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self._peeked = None
+        checkpoint_fingerprint = state.get("manifest_fingerprint")
+        if checkpoint_fingerprint is None:
             logger.warning(
-                "SupervisedDataSource.load_state_dict: checkpoint seed %s != configured seed %s — "
-                "the resumed shuffle order will differ from the original run.",
-                state.get("seed"),
-                self.seed,
+                "SupervisedDataSource.load_state_dict: legacy checkpoint has no manifest fingerprint; "
+                "dataset identity cannot be verified."
             )
-        self._epoch = state["epoch"]
-        self._pos = state["position"]
-        self._order = self._make_order()
-        if self._pos > len(self._order):
+        elif checkpoint_fingerprint != self.dataset.fingerprint:
             raise ValueError(
-                f"SupervisedDataSource.load_state_dict: cursor position {self._pos} exceeds "
-                f"dataset size {len(self._order)} — dataset changed since the checkpoint?"
+                "SupervisedDataSource.load_state_dict: manifest fingerprint mismatch "
+                f"(checkpoint={checkpoint_fingerprint}, current={self.dataset.fingerprint}) — "
+                "refusing to resume against changed data."
             )
+        checkpoint_size = state.get("num_records")
+        if checkpoint_size is not None and checkpoint_size != len(self.dataset):
+            raise ValueError(
+                "SupervisedDataSource.load_state_dict: dataset size mismatch "
+                f"(checkpoint={checkpoint_size}, current={len(self.dataset)})."
+            )
+        if state.get("seed", self.seed) != self.seed:
+            raise ValueError(
+                "SupervisedDataSource.load_state_dict: checkpoint seed "
+                f"{state.get('seed')!r} != configured seed {self.seed!r}; "
+                "refusing to restore a cursor into a different sample order."
+            )
+        if state.get("shuffle", self.shuffle) != self.shuffle:
+            raise ValueError(
+                "SupervisedDataSource.load_state_dict: checkpoint shuffle="
+                f"{state.get('shuffle')!r} != configured shuffle={self.shuffle!r}; "
+                "refusing to restore a cursor into a different sample order."
+            )
+        epoch = state["epoch"]
+        position = state["position"]
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+            raise ValueError(f"SupervisedDataSource.load_state_dict: epoch must be a non-negative int, got {epoch!r}.")
+        if not isinstance(position, int) or isinstance(position, bool) or not 0 <= position <= len(self.dataset):
+            raise ValueError(
+                "SupervisedDataSource.load_state_dict: position must be an int in "
+                f"[0, {len(self.dataset)}], got {position!r}."
+            )
+        self._epoch = epoch
+        self._pos = position
+        self._order = self._make_order()
 
     def iter_eval_batches(self, batch_size: int, *, eval_num_samples: int = -1) -> Iterator[List[Dict[str, Any]]]:
-        """Deterministic-order eval batches (manifest order, no shuffle)."""
-        pool = self.eval_dataset if self.eval_dataset is not None else self.dataset
+        """Yield deterministic eval batches; ``-1`` means all rows and ``0`` means none."""
+        if self.eval_dataset is None:
+            return
+        pool = self.eval_dataset
         n = len(pool)
         limit = n if eval_num_samples < 0 else min(eval_num_samples, n)
         for start in range(0, limit, batch_size):

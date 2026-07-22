@@ -40,6 +40,7 @@ class SFTTrainer(BaseTrainer):
         eval_interval: int = 0,
         eval_batch_size: int = 8,
         eval_num_samples: int = -1,
+        prefetch_next_batch: bool = False,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
@@ -54,8 +55,27 @@ class SFTTrainer(BaseTrainer):
                 "dataset batch. Multi-update SFT is supported by TrainStack but not yet by "
                 "this trainer's outer-step accounting."
             )
+        if not isinstance(prefetch_next_batch, bool):
+            raise TypeError(
+                f"SFTTrainer: prefetch_next_batch must be a bool; got {type(prefetch_next_batch).__name__}."
+            )
+        self.prefetch_next_batch = prefetch_next_batch
+        self._last_phase_times: Dict[str, float] = {}
 
         self.data_source = instantiate(data_source_cfg)
+        self._has_eval_data = bool(getattr(self.data_source, "has_eval_data", True))
+        if self.eval_interval > 0 and not self._has_eval_data:
+            logger.warning(
+                "SFTTrainer: eval_interval=%d but no eval manifest is configured; validation is disabled.",
+                self.eval_interval,
+            )
+        if self.prefetch_next_batch and not all(
+            callable(getattr(self.data_source, name, None)) for name in ("peek_samples", "commit_peeked_samples")
+        ):
+            raise ValueError(
+                "SFTTrainer: prefetch_next_batch requires a data source with "
+                "peek_samples() and commit_peeked_samples()."
+            )
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
@@ -65,20 +85,44 @@ class SFTTrainer(BaseTrainer):
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             self.track_builder = remote_hydra(track_builder_cfg, pipeline=self.pipeline)
 
+        if self.prefetch_next_batch and not callable(getattr(self.track_builder, "prefetch", None)):
+            raise ValueError("SFTTrainer: prefetch_next_batch requires a track builder with prefetch().")
         self.dp_size = self.stack.dp_size
         if self.batch_size % self.dp_size:
             raise ValueError(f"SFTTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}")
         logger.info("SFTTrainer ready: dp=%d batch=%d", self.dp_size, self.batch_size)
 
-    def train_step(self, records: List[Dict[str, Any]], *, training_progress: float = 0.0) -> TrainStepResult:
+    def train_step(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        training_progress: float = 0.0,
+        prefetch_records: Optional[List[Dict[str, Any]]] = None,
+    ) -> TrainStepResult:
         """records → worker-side track build → stack train. No rollout legs."""
+        build_t0 = time.perf_counter()
         part = self.track_builder.build(records)
+        build_time = time.perf_counter() - build_t0
         if part.batch_size != len(records):
             raise RuntimeError(f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records.")
-        return self.stack.train_track(part, training_progress=training_progress)
+        prefetch_t0 = time.perf_counter()
+        if prefetch_records is not None:
+            self.track_builder.prefetch(prefetch_records)
+        prefetch_time = time.perf_counter() - prefetch_t0
+        train_t0 = time.perf_counter()
+        result = self.stack.train_track(part, training_progress=training_progress)
+        self._last_phase_times = {
+            "build_time_s": build_time,
+            "prefetch_time_s": prefetch_time,
+            "train_time_s": time.perf_counter() - train_t0,
+        }
+        return result
 
     def evaluate(self, step: int) -> float:
         """Weighted eval loss over the full validation set; logs ``eval/loss``."""
+        if not self._has_eval_data:
+            logger.warning("SFTTrainer.evaluate: validation is disabled because no eval manifest is configured.")
+            return float("nan")
         loss_sum = 0.0
         weight_sum = 0.0
         batches = 0
@@ -162,16 +206,37 @@ class SFTTrainer(BaseTrainer):
         self._load_data_state(load_dir, start_step)
         self._init_wandb(num_rollouts=num_steps)
         try:
-            if self.eval_interval > 0:
-                self.evaluate(step=-1)
+            if self.eval_interval > 0 and self._has_eval_data:
+                self.evaluate(step=-1)  # baseline eval-loss at step 0
+            records: Optional[List[Dict[str, Any]]] = None
             for step in range(start_step, num_steps):
                 t0 = time.perf_counter()
                 training_progress = step / max(1, num_steps - 1)
-                records = self.data_source.get_samples(self.batch_size)
-                result = self.train_step(records, training_progress=training_progress)
+                data_t0 = time.perf_counter()
+                if self.prefetch_next_batch:
+                    if records is None:
+                        records = self.data_source.get_samples(self.batch_size)
+                    else:
+                        records = self.data_source.commit_peeked_samples()
+                else:
+                    records = self.data_source.get_samples(self.batch_size)
+                prefetch_records = None
+                if self.prefetch_next_batch and step + 1 < num_steps:
+                    prefetch_records = self.data_source.peek_samples(self.batch_size)
+                data_time = time.perf_counter() - data_t0
+                assert records is not None
+                result = self.train_step(
+                    records,
+                    training_progress=training_progress,
+                    prefetch_records=prefetch_records,
+                )
                 dt = time.perf_counter() - t0
+                build_time = self._last_phase_times.get("build_time_s", float("nan"))
+                prefetch_time = self._last_phase_times.get("prefetch_time_s", float("nan"))
+                train_time = self._last_phase_times.get("train_time_s", float("nan"))
                 logger.info(
-                    "step %d/%d  loss=%.5f grad_norm=%.4f lr=%.2e epoch=%.3f  %.1fs",
+                    "step %d/%d  loss=%.5f grad_norm=%.4f lr=%.2e epoch=%.3f  "
+                    "%.1fs (data=%.3fs build=%.3fs prefetch=%.3fs train=%.3fs)",
                     step + 1,
                     num_steps,
                     result.loss,
@@ -179,6 +244,10 @@ class SFTTrainer(BaseTrainer):
                     result.lr,
                     self.data_source.epoch,
                     dt,
+                    data_time,
+                    build_time,
+                    prefetch_time,
+                    train_time,
                 )
                 self.wandb_logger.log_step(
                     step + 1,
@@ -188,11 +257,15 @@ class SFTTrainer(BaseTrainer):
                         "train/lr": result.lr,
                         "train/epoch": self.data_source.epoch,
                         "perf/step_time_s": dt,
+                        "perf/data_time_s": data_time,
+                        "perf/build_time_s": build_time,
+                        "perf/prefetch_time_s": prefetch_time,
+                        "perf/train_time_s": train_time,
                         **{f"train/{k}": v for k, v in dict(result.metrics).items()},
                     },
                     prefix="",
                 )
-                if self.eval_interval > 0 and (step + 1) % self.eval_interval == 0:
+                if self.eval_interval > 0 and self._has_eval_data and (step + 1) % self.eval_interval == 0:
                     self.evaluate(step=step)
                 self.maybe_save_checkpoint(
                     step, num_steps, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
